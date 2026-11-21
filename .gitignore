@@ -1,0 +1,5 @@
+/build/
+*.exe
+*.log
+status.txt
+oem-startup.txt
