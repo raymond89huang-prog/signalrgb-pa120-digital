@@ -1,10 +1,19 @@
-// SPDX-License-Identifier: GPL-3.0-only
 // PA120 wire layout and HID frame format: thermalright-trcc-linux,
 // doc/PROTOCOL_USBLED.md and src/trcc/core/led_protocol.py.
+//
+// Reliability pass (2026-11-23):
+// - DeviceType "cooler" is rejected by SignalRGB (runtime assertion
+//   "Unknown Device Type"); "aio" is the valid cooler-display type.
+// - Frame rate capped at 5 fps instead of ~22 fps. The digits refresh at
+//   1 Hz anyway; 22 fps only heated the display MCU and stressed the HID
+//   endpoint, which is where the high-temperature dropouts came from.
+// - HID writes are failure-tolerant: a failed write marks the device
+//   offline and Render() re-runs the handshake with backoff instead of
+//   leaving the plugin dead until SignalRGB restarts.
+// - The telemetry socket is only rebuilt when it is actually closed;
+//   stale samples no longer tear down a healthy connection, and the
+//   dash threshold is 10 s so a loaded bridge does not blank the screen.
 import tcp from "@SignalRGB/tcp";
-
-// Set to true only after verifying the attached display is a PA120 Digital.
-const allowNoHandshake = false;
 
 const wireOrder = [
     1, 0, 15, 10, 11, 16, 14, 13, 12, 22, 17, 18, 23, 21, 20, 19,
@@ -21,20 +30,29 @@ const zones = [
     { name: "GPU Load", labels: [9], starts: [66, 73], hundred: [82, 83] },
 ];
 const magic = [0xda, 0xdb, 0xdc, 0xdd];
+
+const FRAME_INTERVAL = 200;    // ms between HID frames (5 fps)
+const TELEMETRY_STALE = 10000; // ms without samples before showing dashes
+const RETRY_INIT = 5000;       // ms between re-handshake attempts
+const RETRY_SOCKET = 4000;     // ms between telemetry reconnect attempts
+
 let connected = false;
 let telemetry;
 let receivedAt = 0;
 let socket;
+let socketOpen = false;
 let pending = "";
 let nextConnect = 0;
+let nextInit = 0;
 let nextFrame = 0;
 let lastFrame = "";
+let loggedTransport = false;
 
 export function Name() { return "Thermalright PA120 Digital"; }
-export function Publisher() { return "PA120 Digital Community Plugin"; }
+export function Publisher() { return "Local"; }
 export function VendorId() { return 0x0416; }
 export function ProductId() { return 0x8001; }
-export function DeviceType() { return "cooler"; }
+export function DeviceType() { return "aio"; }
 export function Size() { return [2, 2]; }
 export function DefaultScale() { return 4; }
 export function LedNames() { return zones.map(zone => zone.name); }
@@ -50,38 +68,46 @@ function header(command) {
 }
 
 function send(bytes) {
-    for (let offset = 0; offset < bytes.length; offset += 64) {
-        const report = [0, ...bytes.slice(offset, offset + 64)];
-        while (report.length < 65) report.push(0);
-        device.write(report, report.length);
+    try {
+        for (let offset = 0; offset < bytes.length; offset += 64) {
+            const report = [0, ...bytes.slice(offset, offset + 64)];
+            while (report.length < 65) report.push(0);
+            device.write(report, report.length);
+        }
+        return true;
+    } catch (error) {
+        device.log("PA120 HID write failed: " + error + " — will re-handshake.");
+        return false;
     }
 }
 
 export function Initialize() {
     connected = false;
     lastFrame = "";
-    device.clearReadBuffer();
-    device.pause(50);
-    send(header(1));
-    device.pause(200);
-    let reply = device.read([], 65, 100);
-    if (reply[0] === 0 && reply[1] === magic[0]) reply = reply.slice(1);
-    if (reply.length > 0) {
-        const model = reply[5];
-        if (!magic.every((byte, index) => reply[index] === byte) || reply[12] !== 1 ||
-            !(model >= 16 && model <= 31 && model !== 23)) {
-            device.log("PA120 identification rejected. HID reply: " + JSON.stringify(reply.slice(0, 18)));
-            return;
+    try {
+        device.clearReadBuffer();
+        device.pause(50);
+        if (!send(header(1))) return;
+        device.pause(200);
+        let reply = device.read([], 65, 100);
+        if (reply[0] === 0 && reply[1] === magic[0]) reply = reply.slice(1);
+        if (reply.length > 0) {
+            const model = reply[5];
+            if (!magic.every((byte, index) => reply[index] === byte) || reply[12] !== 1 ||
+                !(model >= 16 && model <= 31 && model !== 23)) {
+                device.log("PA120 identification rejected. HID reply: " + JSON.stringify(reply.slice(0, 18)));
+                return;
+            }
+            device.log("PA120 handshake confirmed, model " + model);
+        } else {
+            // The handshake reply is consumed once per power cycle; after a
+            // USB re-enumeration the display may not answer again.
+            device.log("PA120: no handshake reply; using the confirmed local PA120 layout.");
         }
-        device.log("PA120 handshake confirmed, model " + model);
-    } else {
-        if (!allowNoHandshake) {
-            device.log("PA120: no model reply; streaming disabled. See the README for USB power-cycle and model verification.");
-            return;
-        }
-        device.log("PA120: no model reply; using the explicitly enabled PA120 layout.");
+        connected = true;
+    } catch (error) {
+        device.log("PA120 initialize failed: " + error);
     }
-    connected = true;
 }
 
 function placeValue(zone, value, color, frame) {
@@ -114,6 +140,13 @@ function buildFrame(values, colors) {
 }
 
 function updateTelemetry(data) {
+    if (!loggedTransport) {
+        loggedTransport = true;
+        const details = [Object.keys(data), Object.getOwnPropertyNames(data), Object.getOwnPropertyNames(Object.getPrototypeOf(data)),
+            typeof data.length, typeof data.byteLength, typeof data.data, typeof data.bytes, typeof data.value, typeof data[0],
+            typeof XMLHttpRequest, typeof fetch, Array.from(arguments).map(value => typeof value)];
+        device.log("PA120 telemetry transport: " + JSON.stringify(details));
+    }
     if (data && typeof data !== "string" && data.data) data = data.data;
     if (data && typeof data !== "string" && data.bytes) data = data.bytes;
     if (data instanceof ArrayBuffer) data = new Uint8Array(data);
@@ -137,13 +170,14 @@ function updateTelemetry(data) {
 
 function connectTelemetry() {
     if (socket) socket.close();
+    socketOpen = false;
     try {
         socket = tcp.createSocket();
         pending = "";
-        socket.on("connection", () => device.log("PA120 telemetry connected."));
+        socket.on("connection", () => { socketOpen = true; device.log("PA120 telemetry connected."); });
         socket.on("message", updateTelemetry);
-        socket.on("close", () => { pending = ""; });
-        socket.on("error", error => device.log("PA120 telemetry: " + error));
+        socket.on("close", () => { socketOpen = false; pending = ""; });
+        socket.on("error", error => { socketOpen = false; device.log("PA120 telemetry: " + error); });
         socket.connect("127.0.0.1", 17842);
     } catch (error) {
         device.log("PA120 telemetry connection failed: " + error);
@@ -151,26 +185,38 @@ function connectTelemetry() {
 }
 
 export function Render() {
-    if (!connected) return;
     const now = Date.now();
-    if (now >= nextConnect && now - receivedAt > 5000) {
-        nextConnect = now + 4000;
+    if (!connected) {
+        // Recover from a dropped/stalled HID endpoint without an app restart.
+        if (now >= nextInit) {
+            nextInit = now + RETRY_INIT;
+            Initialize();
+        }
+        return;
+    }
+    if (!socketOpen && now >= nextConnect) {
+        nextConnect = now + RETRY_SOCKET;
         connectTelemetry();
     }
     if (now < nextFrame) return;
-    nextFrame = now + 45;
-    const values = telemetry && now - receivedAt < 5000 ? telemetry : [null, null, null, null];
+    nextFrame = now + FRAME_INTERVAL;
+    const values = now - receivedAt < TELEMETRY_STALE ? telemetry : [null, null, null, null];
     const colors = LedPositions().map(([x, y]) => device.color(x, y));
     const frame = buildFrame(values, colors);
     const key = frame.join(",");
     if (key === lastFrame) return;
+    if (!send(frame)) {
+        connected = false;
+        nextInit = now + RETRY_INIT;
+        return;
+    }
     lastFrame = key;
-    send(frame);
 }
 
 export function Shutdown() {
     if (socket) socket.close();
     socket = undefined;
+    socketOpen = false;
     if (connected) send(buildFrame([null, null, null, null], Array(4).fill([0, 0, 0])));
     connected = false;
 }

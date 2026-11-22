@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
+//
+// Reliability pass (2026-11-23): GPU readings no longer spawn a fresh
+// nvidia-smi process once per second. Under gaming load process creation
+// regularly exceeded the 1.5 s kill timeout, stalling the sample loop past
+// the plugin's stale threshold and blanking the display ("disconnect").
+// A single persistent `nvidia-smi -l` sampler now feeds a cached value,
+// so the 1 Hz broadcast loop never blocks on the GPU driver.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -21,6 +28,12 @@ internal static class Pa120Telemetry
     private static readonly string NvidiaPath = Path.Combine(Environment.SystemDirectory, "nvidia-smi.exe");
     private static readonly string OemPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "TRCCCAP", "HWINFO.exe");
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+
+    private static readonly object GpuLock = new object();
+    private static double? gpuTemperature;
+    private static double? gpuLoad;
+    private static DateTime gpuUpdated = DateTime.MinValue;
+    private static Process gpuSampler;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -74,6 +87,7 @@ internal static class Pa120Telemetry
                 if (!AssignProcessToJobObject(job, oem.Handle)) throw new System.ComponentModel.Win32Exception();
                 oem.OutputDataReceived += LogOemStartup;
                 oem.BeginOutputReadLine();
+                StartGpuSampler();
                 var bytes = new byte[OemDataSize];
                 long lastIdle, lastKernel, lastUser;
                 GetSystemTimes(out lastIdle, out lastKernel, out lastUser);
@@ -133,6 +147,7 @@ internal static class Pa120Telemetry
         {
             foreach (var client in clients) client.Close();
             listener.Stop();
+            StopGpuSampler();
             if (oem != null)
             {
                 try { if (!oem.HasExited) oem.Kill(); }
@@ -222,24 +237,71 @@ internal static class Pa120Telemetry
         return totalDelta > 0 ? (double?)Math.Max(0, Math.Min(100, 100.0 * (1.0 - (double)idleDelta / totalDelta))) : null;
     }
 
+    // One long-lived `nvidia-smi -l` process streams GPU readings every 2 s.
+    // The broadcast loop only reads the cache, so it can never stall on the
+    // GPU driver when the system is under load. The sampler restarts itself
+    // if the driver resets or nvidia-smi exits.
+    private static void StartGpuSampler()
+    {
+        if (!File.Exists(NvidiaPath)) return;
+        var thread = new Thread(GpuSamplerLoop) { IsBackground = true, Name = "GpuSampler" };
+        thread.Start();
+    }
+
+    private static void GpuSamplerLoop()
+    {
+        while (true)
+        {
+            try
+            {
+                using (var process = Process.Start(NewProcessInfo(NvidiaPath,
+                    "--query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits -l 2")))
+                {
+                    lock (GpuLock) gpuSampler = process;
+                    string line;
+                    while ((line = process.StandardOutput.ReadLine()) != null)
+                    {
+                        var fields = line.Split(',');
+                        if (fields.Length != 2) continue;
+                        lock (GpuLock)
+                        {
+                            gpuTemperature = ParseReading(fields[0], 1, 125);
+                            gpuLoad = ParseReading(fields[1], 0, 100);
+                            gpuUpdated = DateTime.UtcNow;
+                        }
+                    }
+                    process.WaitForExit();
+                }
+            }
+            catch (System.ComponentModel.Win32Exception) { }
+            catch (InvalidOperationException) { }
+            catch (IOException) { }
+            finally
+            {
+                lock (GpuLock) gpuSampler = null;
+            }
+            Thread.Sleep(5000); // Back off before respawning the sampler.
+        }
+    }
+
+    private static void StopGpuSampler()
+    {
+        lock (GpuLock)
+        {
+            try { if (gpuSampler != null && !gpuSampler.HasExited) gpuSampler.Kill(); }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+        }
+    }
+
     private static void ReadGpu(out double? temperature, out double? load)
     {
-        temperature = load = null;
-        try
+        lock (GpuLock)
         {
-            using (var process = Process.Start(NewProcessInfo(NvidiaPath, "--query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits")))
-            {
-                if (!process.WaitForExit(1500)) { process.Kill(); return; }
-                string line = process.StandardOutput.ReadLine();
-                if (process.ExitCode != 0 || line == null) return;
-                var fields = line.Split(',');
-                if (fields.Length != 2) return;
-                temperature = ParseReading(fields[0], 1, 125);
-                load = ParseReading(fields[1], 0, 100);
-            }
+            bool fresh = (DateTime.UtcNow - gpuUpdated).TotalSeconds < 8;
+            temperature = fresh ? gpuTemperature : null;
+            load = fresh ? gpuLoad : null;
         }
-        catch (System.ComponentModel.Win32Exception) { }
-        catch (InvalidOperationException) { }
     }
 
     private static double? ParseReading(string text, double minimum, double maximum)

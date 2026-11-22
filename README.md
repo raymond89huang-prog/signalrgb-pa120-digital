@@ -21,6 +21,14 @@ Once the manual test works, create a Windows Task Scheduler task for the bridge.
 
 The bridge publishes newline-delimited JSON once per sample to `127.0.0.1:17842`. Each sample is an array in display order `[cpuTemperatureC, cpuUtilizationPercent, gpuTemperatureC, gpuUtilizationPercent]`. Missing readings appear as JSON `null` and display as dashes. An unrecognized CPU sensor label or unavailable NVIDIA tooling can leave one or more fields empty. See `status.txt` beside the bridge executable for which readings are available, and check the SignalRGB device log for USB and TCP diagnostics.
 
+## 2026-11-23 reliability update
+
+- Fixed an unsupported `cooler` device type (now `aio`) that triggered a SignalRGB runtime assertion.
+- Frame rate capped at 5 fps; sustained ~22 fps HID writes could stall the heat-soaked display MCU and drop the device at high CPU temperatures.
+- HID write failures now trigger automatic re-handshake recovery instead of requiring a SignalRGB restart.
+- The telemetry socket is only rebuilt when actually closed, and the stale threshold is 10 s, so a loaded bridge no longer blanks the display.
+- The bridge samples the GPU with one persistent `nvidia-smi -l` process instead of spawning it every second, removing sample stalls under gaming load.
+
 ## License and protocol credits
 
 GPL-3.0-only. See [LICENSE](LICENSE). The PA120 USB frame format and segment mapping were adapted into the JavaScript plugin from the GPL-3.0 [thermalright-trcc-linux protocol notes](https://github.com/Lexonight1/thermalright-trcc-linux/blob/main/doc/PROTOCOL_USBLED.md) and [LED protocol implementation](https://github.com/Lexonight1/thermalright-trcc-linux/blob/main/src/trcc/core/led_protocol.py), by Lexonight1 and contributors. Thermalright and NVIDIA software are installed separately.
